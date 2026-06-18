@@ -9,7 +9,6 @@ import {
   Users,
   AlarmClock,
   MapPin,
-  User,
   type LucideIcon,
 } from "lucide-react";
 import type { Category, ScheduleEvent } from "@/lib/schedule";
@@ -94,12 +93,6 @@ export function EventCard({ event }: { event: ScheduleEvent }) {
 
       <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1">
         <span className="text-time text-ink">{formatTime(event.time, event.endTime)}</span>
-        {event.who && (
-          <span className="text-meta inline-flex items-center gap-1">
-            <User className="size-3" />
-            {event.who}
-          </span>
-        )}
         {event.location && (
           <span className="text-meta inline-flex items-center gap-1">
             <MapPin className="size-3" />

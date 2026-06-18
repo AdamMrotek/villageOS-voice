@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>VillageOS Voice — How it works</title>
+<style>
+  :root {
+    --bg: #faf8f4;
+    --surface: #ffffff;
+    --surface-alt: #f3efe8;
+    --ink: #2a2622;
+    --ink-soft: #5c554c;
+    --ink-mute: #8c8479;
+    --hairline: #e7e1d7;
+    --accent: #3f6f4b;        /* meadow green */
+    --accent-soft: #e7f0e8;
+    --warm: #b4541f;
+    --warm-soft: #f6e7dc;
+    --browser: #2b6cb0;
+    --server: #6b46c1;
+    --eleven: #111111;
+    --shadow: 0 1px 2px rgba(0,0,0,.05), 0 8px 24px rgba(0,0,0,.05);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 48px 24px 96px; }
+  header.page { margin-bottom: 8px; }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .logo {
+    width: 30px; height: 30px; border-radius: 6px; background: var(--ink);
+    color: var(--bg); display: grid; place-items: center; font-weight: 700;
+    font-family: Georgia, serif;
+  }
+  .brand h1 { font-size: 22px; margin: 0; letter-spacing: -.01em; }
+  .brand .tag {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .12em;
+    color: var(--accent); font-weight: 700; padding-top: 4px;
+  }
+  .lede { color: var(--ink-soft); max-width: 70ch; margin: 14px 0 40px; }
+  h2 {
+    font-size: 13px; text-transform: uppercase; letter-spacing: .1em;
+    color: var(--ink-mute); margin: 56px 0 4px;
+  }
+  h2 + .sub { color: var(--ink-soft); margin: 0 0 22px; max-width: 72ch; }
+
+  /* ---- generic boxes ---- */
+  .node {
+    border: 1px solid var(--hairline); background: var(--surface);
+    border-radius: 12px; padding: 14px 16px; box-shadow: var(--shadow);
+    position: relative;
+  }
+  .node .kicker {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: .1em;
+    font-weight: 700; margin-bottom: 4px;
+  }
+  .node .title { font-weight: 650; }
+  .node .desc { color: var(--ink-soft); font-size: 13px; margin-top: 4px; }
+  .k-browser { color: var(--browser); }
+  .k-server  { color: var(--server); }
+  .k-eleven  { color: var(--eleven); }
+  .b-browser { border-top: 3px solid var(--browser); }
+  .b-server  { border-top: 3px solid var(--server); }
+  .b-eleven  { border-top: 3px solid var(--eleven); }
+
+  code, .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .88em; background: var(--surface-alt); padding: 1px 5px;
+    border-radius: 5px;
+  }
+
+  /* ---- flow diagram ---- */
+  .flow {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 18px 14px;
+    align-items: stretch;
+  }
+  .lane-label {
+    grid-column: 1 / -1; display: flex; align-items: center; gap: 8px;
+    font-size: 11px; text-transform: uppercase; letter-spacing: .1em;
+    color: var(--ink-mute); font-weight: 700; margin-top: 6px;
+  }
+  .lane-label::after { content:""; flex:1; height:1px; background:var(--hairline); }
+  .step-num {
+    position: absolute; top: -10px; left: -10px; width: 22px; height: 22px;
+    background: var(--ink); color: var(--bg); border-radius: 50%;
+    display: grid; place-items: center; font-size: 12px; font-weight: 700;
+  }
+  .arrow-row {
+    grid-column: 1 / -1; text-align: center; color: var(--ink-mute);
+    font-size: 13px; letter-spacing: .02em;
+  }
+  .arrow-row b { color: var(--ink); font-weight: 650; }
+  .down { font-size: 18px; line-height: 1; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin: 16px 0 0; }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-soft); }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; }
+
+  /* ---- state machine ---- */
+  .states { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+  .state {
+    border: 1px solid var(--hairline); background: var(--surface);
+    border-radius: 999px; padding: 9px 16px; font-weight: 600; font-size: 13.5px;
+    box-shadow: var(--shadow); white-space: nowrap;
+  }
+  .state small { display: block; font-weight: 400; color: var(--ink-mute); font-size: 11px; }
+  .state.idle { background: var(--surface-alt); }
+  .state.thinking { border-color: var(--accent); background: var(--accent-soft); }
+  .state.speaking { border-color: var(--warm); background: var(--warm-soft); }
+  .state.error { border-color: #c0392b; color: #c0392b; }
+  .to { color: var(--ink-mute); font-weight: 700; }
+  .note-inline {
+    margin-top: 14px; font-size: 13px; color: var(--ink-soft);
+    border-left: 3px solid var(--accent); padding: 6px 0 6px 14px;
+  }
+
+  /* ---- two-payload split ---- */
+  .split { display: grid; grid-template-columns: 1fr; gap: 16px; }
+  @media (min-width: 760px) { .split { grid-template-columns: 1.1fr 1fr 1fr; align-items: start; } }
+  pre {
+    margin: 0; background: #1f1b16; color: #f1ece3; border-radius: 10px;
+    padding: 14px 16px; overflow-x: auto; font-size: 12.5px; line-height: 1.55;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    box-shadow: var(--shadow);
+  }
+  pre .c { color: #8aa6a0; }      /* comment / key */
+  pre .v { color: #d7b377; }      /* value */
+  pre .d { color: #6f6457; text-decoration: line-through; } /* dropped */
+  .payload-head { font-weight: 650; margin: 0 0 8px; display:flex; align-items:center; gap:8px; }
+  .pill { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing:.08em; padding: 2px 8px; border-radius: 999px; }
+  .pill.ui { background: var(--browser); color: #fff; }
+  .pill.model { background: var(--accent); color: #fff; }
+  .arrowcol { display: grid; place-items: center; color: var(--ink-mute); }
+
+  /* ---- mapper ---- */
+  .map { display: grid; grid-template-columns: 1fr; gap: 14px; align-items: center; }
+  @media (min-width: 720px) { .map { grid-template-columns: 1fr auto 1fr; } }
+  .map .arrowcol { font-size: 22px; }
+  ul.tight { margin: 8px 0 0; padding-left: 18px; color: var(--ink-soft); font-size: 13px; }
+  ul.tight li { margin: 3px 0; }
+
+  footer { margin-top: 72px; color: var(--ink-mute); font-size: 12.5px; border-top: 1px solid var(--hairline); padding-top: 16px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="page">
+    <div class="brand">
+      <span class="logo">V</span>
+      <h1>VillageOS&nbsp;Voice</h1>
+      <span class="tag">How it works</span>
+    </div>
+    <p class="lede">
+      A voice-first companion that answers questions about a family's week out
+      loud, surfacing the schedule as live cards. Below: the request flow, the
+      state machine that drives every pixel, the two-payload split, and the
+      anti-corruption mapper.
+    </p>
+  </header>
+
+  <!-- ============ 1. REQUEST FLOW ============ -->
+  <h2>1 · The request flow</h2>
+  <p class="sub">
+    One full round trip of “What’s on tomorrow?” — from spoken words to spoken
+    answer. Colour = where the code runs.
+  </p>
+
+  <div class="flow">
+
+    <div class="lane-label">Connect (once per session)</div>
+
+    <div class="node b-browser">
+      <span class="step-num">1</span>
+      <div class="kicker k-browser">Browser</div>
+      <div class="title">Tap the orb</div>
+      <div class="desc">Request a session from our own server.</div>
+    </div>
+    <div class="node b-server">
+      <span class="step-num">2</span>
+      <div class="kicker k-server">Our server</div>
+      <div class="title"><code>/api/conversation-token</code></div>
+      <div class="desc">Mints a short-lived <b>WebRTC token</b>. The ElevenLabs API key never leaves the server.</div>
+    </div>
+    <div class="node b-eleven">
+      <span class="step-num">3</span>
+      <div class="kicker k-eleven">ElevenLabs</div>
+      <div class="title">WebRTC session opens</div>
+      <div class="desc"><code>startSession({ conversationToken })</code> — low-latency for snappy barge-in.</div>
+    </div>
+
+    <div class="lane-label">Ask &amp; answer (every turn)</div>
+
+    <div class="node b-browser">
+      <span class="step-num">4</span>
+      <div class="kicker k-browser">Browser → ElevenLabs</div>
+      <div class="title">You speak</div>
+      <div class="desc">Audio streams over WebRTC; the SDK handles VAD, turn-taking &amp; STT.</div>
+    </div>
+    <div class="node b-eleven">
+      <span class="step-num">5</span>
+      <div class="kicker k-eleven">Agent (LLM)</div>
+      <div class="title">Decides to fetch</div>
+      <div class="desc">Calls the <b>client tool</b> <code>get_schedule(day)</code> — running back in the browser.</div>
+    </div>
+    <div class="node b-browser">
+      <span class="step-num">6</span>
+      <div class="kicker k-browser">Browser (client tool)</div>
+      <div class="title"><code>fetch /api/schedule</code></div>
+      <div class="desc">Identity &amp; data stay on our side — no user context handed out.</div>
+    </div>
+
+    <div class="arrow-row down">↓ the tool result does double duty ↓</div>
+
+    <div class="node b-browser">
+      <span class="step-num">7</span>
+      <div class="kicker k-browser">Browser (UI)</div>
+      <div class="title">Render event cards</div>
+      <div class="desc">Full <code>ScheduleEvent[]</code> pushed into the chat timeline.</div>
+    </div>
+    <div class="node b-eleven">
+      <span class="step-num">8</span>
+      <div class="kicker k-eleven">Agent (LLM)</div>
+      <div class="title">Speaks the answer</div>
+      <div class="desc">Gets a <b>token-lean projection</b> back as the tool result, then talks.</div>
+    </div>
+    <div class="node b-browser">
+      <span class="step-num">9</span>
+      <div class="kicker k-browser">Browser</div>
+      <div class="title">Cards + transcript</div>
+      <div class="desc">Voice &amp; UI stay in sync — from one source.</div>
+    </div>
+
+  </div>
+
+  <div class="legend">
+    <span><span class="swatch" style="background:var(--browser)"></span> Browser (this app's client)</span>
+    <span><span class="swatch" style="background:var(--server)"></span> Our server (Next.js route)</span>
+    <span><span class="swatch" style="background:var(--eleven)"></span> ElevenLabs (SDK + agent)</span>
+  </div>
+
+  <!-- ============ 2. STATE MACHINE ============ -->
+  <h2>2 · One state machine drives every pixel</h2>
+  <p class="sub">
+    <code>status</code> + <code>isSpeaking</code> + a tool-pending flag collapse
+    into a single <code>VoiceState</code>. The orb, the labels, and the timeline
+    all render from it.
+  </p>
+
+  <div class="states">
+    <div class="state idle">idle <small>tap to talk</small></div>
+    <span class="to">→</span>
+    <div class="state">connecting <small>minting token</small></div>
+    <span class="to">→</span>
+    <div class="state">listening <small>hearing you</small></div>
+    <span class="to">→</span>
+    <div class="state thinking">thinking <small>tool in flight</small></div>
+    <span class="to">→</span>
+    <div class="state speaking">speaking <small>agent talks</small></div>
+    <span class="to">↺</span>
+    <div class="state error">error</div>
+  </div>
+
+  <p class="note-inline">
+    The non-obvious bit: the SDK exposes <b>no “thinking” state</b>. It’s
+    <i>inferred</i> — set true while <code>get_schedule</code> is in flight,
+    cleared the instant the agent starts speaking (with a timeout fallback). That
+    inferred state is what makes retrieval feel like the agent is <i>doing</i>
+    something rather than freezing.
+  </p>
+
+  <!-- ============ 3. TWO PAYLOADS ============ -->
+  <h2>3 · The voice→UI handshake: one fetch, two payloads</h2>
+  <p class="sub">
+    The same <code>/api/schedule</code> result is split. The UI gets everything
+    it needs to render; the model gets only what it will <i>speak</i> — because
+    the tool result is re-sent to the LLM on <b>every</b> later turn, so unspoken
+    fields are recurring token waste.
+  </p>
+
+  <div class="split">
+    <div>
+      <p class="payload-head">Source event</p>
+      <pre><span class="c">{</span>
+  id: <span class="v">"612b…dd26"</span>,
+  title: <span class="v">"Mia's 7th birthday"</span>,
+  category: <span class="v">"birthday"</span>,
+  time: <span class="v">"14:00"</span>, endTime: <span class="v">"16:00"</span>,
+  isAllDay: <span class="v">false</span>,
+  date: <span class="v">"2026-06-20"</span>,
+  dayLabel: <span class="v">"In 2 days · Sat 20 Jun"</span>,
+  location: <span class="v">"Jungle Play"</span>,
+  actions: [
+    { description: <span class="v">"Buy present"</span>,
+      costEstimateGbp: <span class="v">15</span>, done: <span class="v">false</span> },
+    { description: <span class="v">"Reply RSVP"</span>, done: <span class="v">true</span> }
+  ]
+<span class="c">}</span></pre>
+    </div>
+
+    <div class="arrowcol">
+      <div style="text-align:center">
+        <div style="font-size:22px">⇒</div>
+        <div style="font-size:12px;color:var(--ink-mute)">split</div>
+      </div>
+    </div>
+
+    <div>
+      <p class="payload-head"><span class="pill ui">UI</span> full object</p>
+      <pre><span class="c">// →  &lt;ChatEvent /&gt; row</span>
+title, time–endTime,
+category badge, location,
+to-do chips (£15),
+<span class="c">// keeps ids, dates,</span>
+<span class="c">// done items, flags…</span></pre>
+
+      <p class="payload-head" style="margin-top:16px"><span class="pill model">MODEL</span> <code>toAgentSchedule()</code></p>
+      <pre><span class="c">{</span>
+  title: <span class="v">"Mia's 7th birthday"</span>,
+  when: <span class="v">"In 2 days…, 14:00–16:00"</span>,
+  where: <span class="v">"Jungle Play"</span>,
+  todo: [{ task: <span class="v">"Buy present"</span>,
+           costGbp: <span class="v">15</span> }]
+<span class="c">}</span>
+<span class="d">id  category  isAllDay  date</span>
+<span class="d">done actions  …  dropped</span></pre>
+    </div>
+  </div>
+
+  <!-- ============ 4. MAPPER ============ -->
+  <h2>4 · An anti-corruption mapper around VillageOS’s schema</h2>
+  <p class="sub">
+    The source snapshot mirrors the <b>real VillageOS API payload</b>
+    (snake_case). A mapper converts it to the voice app’s own stable contract, so
+    when this swaps to a live query, only the mapper has to change.
+  </p>
+
+  <div class="map">
+    <div class="node b-server">
+      <div class="kicker k-server">VillageOS shape (snake_case)</div>
+      <div class="title"><code>VillageEvent</code></div>
+      <ul class="tight">
+        <li><code>event_type</code>, <code>start_time</code> / <code>end_time</code></li>
+        <li><code>is_all_day</code>, <code>action_items[]</code></li>
+        <li><code>cost_estimate_gbp</code>, <code>urgent</code>, <code>done</code></li>
+        <li>seeded with relative <code>dayOffset</code>, resolved to real dates at request time</li>
+      </ul>
+    </div>
+
+    <div class="arrowcol">
+      <div style="text-align:center">
+        <div>→</div>
+        <div style="font-size:11px;color:var(--ink-mute);max-width:120px"><code>toScheduleEvent()</code></div>
+      </div>
+    </div>
+
+    <div class="node b-browser">
+      <div class="kicker k-browser">Voice app contract (camelCase)</div>
+      <div class="title"><code>ScheduleEvent</code></div>
+      <ul class="tight">
+        <li><code>category</code>, <code>time</code> / <code>endTime</code></li>
+        <li><code>isAllDay</code>, <code>actions[]</code></li>
+        <li><code>costEstimateGbp</code>, human <code>dayLabel</code></li>
+        <li>stable even if VillageOS’s schema drifts</li>
+      </ul>
+    </div>
+  </div>
+
+  <footer>
+    Generated companion to <code>README.md</code>. Open this file in a browser.
+    Source of truth: <code>src/components/voice-companion.tsx</code>,
+    <code>src/lib/schedule.ts</code>, <code>src/lib/voice-state.ts</code>.
+  </footer>
+
+</div>
+</body>
+</html>
