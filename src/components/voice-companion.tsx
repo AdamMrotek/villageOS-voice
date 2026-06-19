@@ -307,6 +307,13 @@ function Stage() {
     setErrored(false);
     setErrorMsg(undefined);
     try {
+      // Request the mic synchronously, before any await, so the permission
+      // prompt fires inside the orb-tap's user gesture. Mobile Safari rejects
+      // getUserMedia with NotAllowedError (and shows no prompt) if the gesture
+      // has already been consumed by an awaited fetch — so we grab it first and
+      // let the SDK reuse the granted permission below.
+      await navigator.mediaDevices.getUserMedia({ audio: true });
+
       const res = await fetch("/api/conversation-token");
       if (!res.ok) throw new Error(`token request failed (${res.status})`);
       const { conversationToken } = (await res.json()) as {
@@ -327,7 +334,19 @@ function Stage() {
       });
     } catch (e) {
       console.error("[voice] startSession threw:", e);
-      setErrorMsg(e instanceof Error ? e.message : "Could not start the session");
+      // A blocked/denied mic surfaces as NotAllowedError (often with no prompt,
+      // e.g. permission previously denied, or embedded in an iframe without
+      // allow="microphone"). Give an actionable message instead of the raw text.
+      const isMicDenied =
+        e instanceof DOMException &&
+        (e.name === "NotAllowedError" || e.name === "SecurityError");
+      setErrorMsg(
+        isMicDenied
+          ? "Microphone access is blocked. Allow the mic for this site in your browser settings, then tap to try again."
+          : e instanceof Error
+          ? e.message
+          : "Could not start the session"
+      );
       setErrored(true);
     }
   }, [conversation]);
