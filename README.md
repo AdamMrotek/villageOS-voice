@@ -49,10 +49,16 @@ You speak ─▶ ElevenLabs agent (WebRTC) ─▶ calls get_schedule client tool
 - **Tap to nudge the conversation.** Voice is the input; alongside it, tappable
   chips (empty-state example prompts and the to-do chips on event rows) send a
   message into the same stream, starting or resuming the session as needed.
+- **Works when the mic doesn't.** If the mic is blocked (in-app browsers, denied
+  permission, locked-down devices), the app falls back to a **text-only session
+  that still speaks** — you type, and the agent's reply is read back in its own
+  voice. See [ADR 0002](./docs/adr/0002-text-fallback-with-tts-readout.md).
 - **State-driven UI.** Every visual is driven from one agent state machine
-  (`idle → connecting → listening → thinking → speaking`). The orb is
-  audio-reactive — it breathes with the live mic/agent loudness via the SDK's
-  frequency data (`getOutput/InputByteFrequencyData`).
+  (`idle → connecting → listening → thinking → speaking`). Each state has a
+  distinct glyph + motion so it's obvious what the app wants (Mic + "tap me" ring
+  to connect, a waveform with sonar ripples while listening, a stop square while
+  speaking). The orb is audio-reactive — it breathes with the live mic/agent
+  loudness via the SDK's frequency data (`getOutput/InputByteFrequencyData`).
 - **The voice→UI handshake.** The `get_schedule` client tool does double duty:
   it renders event rows _and_ returns a structured projection to the model so it
   can speak them. Tool output is never dumped as raw text.
@@ -68,8 +74,9 @@ You speak ─▶ ElevenLabs agent (WebRTC) ─▶ calls get_schedule client tool
 |---|---|
 | Framework | Next.js 16 (App Router) · React 19 · TypeScript |
 | Voice | ElevenLabs Conversational Agents · `@elevenlabs/react` v1 |
-| Connection | WebRTC, server-minted conversation token (`/api/conversation-token`) |
-| Input | Voice, plus tappable prompt / to-do chips that post into the same stream |
+| Connection | WebRTC, server-minted conversation token (`/api/conversation-token`); text fallback over a WebSocket signed URL (`/api/signed-url`) |
+| Input | Voice, plus tappable prompt / to-do chips and a text composer (mic-blocked fallback) — all post into the same stream |
+| Readout | Live voice on WebRTC; in text mode, agent replies are spoken via server-side TTS in the agent's voice (`/api/tts`) |
 | Data | VillageOS-shaped 3-day snapshot behind an anti-corruption mapper (`/api/schedule`, `src/lib/schedule.ts`) |
 | UI | Tailwind v4, shadcn/ui, framer-motion, the Meadow design system |
 
@@ -139,7 +146,9 @@ on reconnect the recent transcript is re-fed via `sendContextualUpdate` (capped
 at the last N turns) — the agent continues instead of re-greeting. The same
 `requestAnimationFrame` loop that drives the orb doubles as a silence watchdog:
 after a few seconds of no voice / no tool activity it auto-hangs-up to free the
-mic, and the visible transcript survives so the next turn resumes cleanly.
+mic, and the visible transcript survives so the next turn resumes cleanly. Text
+sessions have no mic to watch, so they use a typed-activity idle timer instead
+(re-armed on each send) — otherwise the agent fills the silence with nudges.
 
 ### 8. A token-lean tool result, separate from the UI payload
 The tool result is pinned into the conversation and re-sent to the model every
@@ -163,6 +172,19 @@ The orb breathes with live loudness by reading frequency data in a
 loop reads through **stable function refs** and a `speakingRef`, keeping the
 effect from re-subscribing every frame.
 
+### 11. A text fallback that still speaks
+A blocked mic shouldn't end the conversation. When `getUserMedia` throws (in-app
+browsers, denied permission, gesture loss), the app drops to a **text-only
+WebSocket session** that never requests the mic — and because that mode is
+otherwise *silent*, each agent reply is sent to `/api/tts` and read back in the
+**agent's own voice**. The non-obvious bits: the WebRTC token doesn't work for the
+text path (it needs a signed URL); the TTS endpoint needs a real TTS model, not
+the agent's conversational one; `voice_settings` are clamped with a
+retry-without-settings fallback so a bad value degrades delivery instead of going
+silent; and iOS autoplay is unlocked inside the send gesture so the
+async-fetched audio can play. Full rationale in
+[ADR 0002](./docs/adr/0002-text-fallback-with-tts-readout.md).
+
 ### Honest limitations
 - Data is a hardcoded snapshot (Level 1) — deliberately, to keep the focus on the
   front-end + agent integration. The seed already mirrors VillageOS's schema; the
@@ -178,6 +200,16 @@ npm install
 npm run dev
 ```
 
+**Optional env** (text-mode readout — all default to the agent's own voice/config):
+
+| Var | Purpose |
+|---|---|
+| `ELEVENLABS_VOICE_ID` | Override the readout voice (default: the agent's voice) |
+| `ELEVENLABS_TTS_MODEL` | TTS model (default `eleven_flash_v2_5`) |
+| `ELEVENLABS_TTS_SPEED` | Readout pace, 0.7–1.2 (1.0 = normal) |
+| `ELEVENLABS_TTS_STABILITY` | 0–1, lower = more expressive |
+| `ELEVENLABS_TTS_STYLE` | 0–1, higher = more stylistic |
+
 Create the agent first — see [`AGENT.md`](./AGENT.md) for the dashboard setup and
 the `get_schedule` client-tool definition. The canonical system prompt lives in
 [`agent-prompt.md`](./agent-prompt.md) (kept in git so prompt changes are
@@ -192,4 +224,6 @@ reviewable — update it and the dashboard together).
 - `src/lib/voice-state.ts` — the `VoiceState` machine and its copy
 - `src/lib/schedule.ts` — snapshot, anti-corruption mapper, token-lean projection
 - `src/app/api/conversation-token/route.ts` — server-side WebRTC token
+- `src/app/api/signed-url/route.ts` — WebSocket signed URL for the text fallback
+- `src/app/api/tts/route.ts` — server-side TTS readout (agent's voice) for text mode
 - `src/app/api/schedule/route.ts` — the snapshot endpoint
