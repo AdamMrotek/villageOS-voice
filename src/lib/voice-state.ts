@@ -11,9 +11,9 @@ export type VoiceState =
   | "error";
 
 export const STATE_COPY: Record<VoiceState, { label: string; hint: string }> = {
-  idle: { label: "Tap to talk", hint: "Ask about today, tomorrow, or the week" },
+  idle: { label: "Tap to start talking", hint: "Ask about today, tomorrow, or the week" },
   connecting: { label: "Connecting…", hint: "Setting up the conversation" },
-  listening: { label: "Listening", hint: "Go ahead — I'm all ears" },
+  listening: { label: "Listening — go ahead", hint: "Speak now; tap to stop" },
   thinking: { label: "Checking the schedule…", hint: "Pulling up the events" },
   speaking: { label: "Speaking", hint: "Tap stop to interrupt any time" },
   error: { label: "Something went wrong", hint: "Tap to try again" },

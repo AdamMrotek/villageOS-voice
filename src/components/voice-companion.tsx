@@ -20,6 +20,13 @@ type AgentTools = {
 
 /** Auto-hang-up after this much continuous silence (no voice, no tool). */
 const SILENCE_TIMEOUT_MS = 5_000;
+/**
+ * Text sessions have no mic for the silence watchdog to read, so they'd stay
+ * open forever (and the agent fills the gap with "are you still there?" nudges).
+ * Instead we hang up this long after the user's last typed message. Re-armed on
+ * every send; cleared on disconnect. Generous enough to cover a reply + readout.
+ */
+const TEXT_IDLE_TIMEOUT_MS = 25_000;
 /** Amplitude below this counts as "silence" (above the mic noise floor). */
 const SILENCE_LEVEL = 0.04;
 
@@ -90,6 +97,9 @@ function Stage() {
   const [amplitude, setAmplitude] = useState(0);
   const [errored, setErrored] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string>();
+  // Mic blocked (or the user chose to type): drop to a text-only websocket
+  // session that never touches getUserMedia, and show a text input in the dock.
+  const [textMode, setTextMode] = useState(false);
   const thinkingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dockRef = useRef<HTMLDivElement>(null);
   const [dockHeight, setDockHeight] = useState(0);
@@ -111,8 +121,13 @@ function Stage() {
 
   const conversation = useConversation({
     onConnect: () => {
+      console.log("[voice] onConnect; isTextSession=", liveSessionIsTextRef.current);
       setErrored(false);
       setErrorMsg(undefined);
+      // Websocket (text) sessions only fire onConnect *after* the init handshake,
+      // so the data channel is ready here — flush now. (WebRTC defers to
+      // onConversationMetadata; see the note there.)
+      if (liveSessionIsTextRef.current) flushPendingRef.current();
     },
     // Flush the seed (a tapped example / text that started the session) and the
     // resume transcript HERE, not in onConnect. On the WebRTC transport onConnect
@@ -123,20 +138,15 @@ function Stage() {
     // ways and the agent is ready. (This regressed when the dashboard "First
     // message" was blanked: the greeting used to mask the dropped first turn.)
     onConversationMetadata: () => {
-      // Resuming a prior session? Re-feed the recent transcript as context so the
-      // agent continues where we left off (it has no server-side memory). Sent
-      // before any queued text so the agent answers it already in context.
-      const resume = buildResumeContext(timelineRef.current);
-      if (resume) conversationRef.current?.sendContextualUpdate(resume);
-      // Flush anything typed/tapped before the data channel was ready.
-      const queued = pendingTextRef.current;
-      pendingTextRef.current = [];
-      queued.forEach((t) => conversationRef.current?.sendUserMessage(t));
+      console.log("[voice] onConversationMetadata");
+      flushPendingRef.current();
     },
     onDisconnect: (details) => {
       console.log("[voice] disconnect", details);
       setAmplitude(0);
       setToolPending(false);
+      liveSessionIsTextRef.current = false;
+      clearTextIdleRef.current();
     },
     onError: (message, context) => {
       console.error("[voice] error:", message, context);
@@ -165,7 +175,13 @@ function Stage() {
         // We append it and let the bubble reveal it word-by-word (TypewriterText)
         // so it shows immediately and animates in step with the voice.
         const clean = stripMarkers(message);
-        if (clean) appendMsg("agent", clean);
+        if (clean) {
+          console.log("[voice] agent message; isTextSession=", liveSessionIsTextRef.current, "text=", clean);
+          appendMsg("agent", clean);
+          // A text session produces no audio of its own, so read the reply aloud
+          // via the TTS route to keep the ElevenLabs voice.
+          if (liveSessionIsTextRef.current) playTtsRef.current(clean);
+        }
       }
     },
   });
@@ -255,6 +271,140 @@ function Stage() {
   speakingRef.current = isSpeaking;
   const toolPendingRef = useRef(false);
   toolPendingRef.current = toolPending;
+  // Text-only sessions have no mic, so the silence watchdog must never hang them up.
+  const textModeRef = useRef(false);
+  textModeRef.current = textMode;
+  // True only while the *live* session is a text conversation (no native audio),
+  // so we TTS the agent's replies for exactly those sessions — never doubling up
+  // with a voice session that already plays its own audio.
+  const liveSessionIsTextRef = useRef(false);
+
+  // --- Text-mode TTS: speak agent replies aloud (text sessions emit no audio) ---
+  const [ttsSpeaking, setTtsSpeaking] = useState(false);
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const ttsUnlockedRef = useRef(false);
+  const ttsQueueRef = useRef<string[]>([]);
+  const ttsDrainingRef = useRef(false);
+  // Silent clip used to "unlock" audio playback within a user gesture, so iOS
+  // lets us play the (async-fetched) TTS audio that arrives after the gesture.
+  const SILENT_WAV =
+    "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+
+  // Call from a user gesture (send / mode switch) to prime the audio element.
+  const unlockTtsAudio = useCallback(() => {
+    if (ttsUnlockedRef.current) return;
+    const el = ttsAudioRef.current ?? new Audio();
+    ttsAudioRef.current = el;
+    el.src = SILENT_WAV;
+    el.play().then(
+      () => {
+        ttsUnlockedRef.current = true;
+      },
+      () => {}
+    );
+  }, []);
+
+  const stopTts = useCallback(() => {
+    ttsQueueRef.current = [];
+    const el = ttsAudioRef.current;
+    if (el) {
+      el.pause();
+      el.removeAttribute("src");
+    }
+    setTtsSpeaking(false);
+  }, []);
+
+  // Text-session idle hang-up (mirrors the voice silence watchdog). Re-armed on
+  // each user send; if it fires mid-readout/tool we wait and re-check so we never
+  // cut off a real reply, only the dead air the agent would otherwise nudge into.
+  const textIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearTextIdle = useCallback(() => {
+    if (textIdleTimerRef.current) {
+      clearTimeout(textIdleTimerRef.current);
+      textIdleTimerRef.current = null;
+    }
+  }, []);
+  // Stable handle so onDisconnect (created once) can clear the timer.
+  const clearTextIdleRef = useRef(clearTextIdle);
+  clearTextIdleRef.current = clearTextIdle;
+  const armTextIdle = useCallback(() => {
+    clearTextIdle();
+    const check = () => {
+      if (ttsDrainingRef.current || toolPendingRef.current) {
+        textIdleTimerRef.current = setTimeout(check, 3_000);
+        return;
+      }
+      console.log("[voice] text session idle — hanging up");
+      textIdleTimerRef.current = null;
+      stopTts();
+      endSessionRef.current();
+    };
+    textIdleTimerRef.current = setTimeout(check, TEXT_IDLE_TIMEOUT_MS);
+  }, [clearTextIdle, stopTts]);
+
+  const drainTts = useCallback(async () => {
+    if (ttsDrainingRef.current) return;
+    ttsDrainingRef.current = true;
+    try {
+      while (ttsQueueRef.current.length > 0) {
+        const text = ttsQueueRef.current.shift()!;
+        setTtsSpeaking(true);
+        try {
+          console.log("[tts] fetching audio for:", text.slice(0, 60));
+          const res = await fetch("/api/tts", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text }),
+          });
+          console.log("[tts] /api/tts status:", res.status);
+          if (!res.ok) throw new Error(`tts failed (${res.status})`);
+          const url = URL.createObjectURL(await res.blob());
+          const el = ttsAudioRef.current ?? new Audio();
+          ttsAudioRef.current = el;
+          el.src = url;
+          console.log("[tts] playing audio…");
+          await el.play();
+          console.log("[tts] playback started");
+          await new Promise<void>((resolve) => {
+            el.onended = () => resolve();
+            el.onerror = () => resolve();
+          });
+          URL.revokeObjectURL(url);
+        } catch (err) {
+          console.warn("[voice] tts playback failed:", err);
+        }
+      }
+    } finally {
+      ttsDrainingRef.current = false;
+      setTtsSpeaking(false);
+    }
+  }, []);
+
+  const playTtsRef = useRef<(text: string) => void>(() => {});
+  playTtsRef.current = (text: string) => {
+    ttsQueueRef.current.push(text);
+    void drainTts();
+  };
+
+  // Send the resume context + any messages queued before the channel was ready.
+  // Runs once per session (reset in startSession); both transports call it, but
+  // at different times — onConnect for websocket/text, onConversationMetadata for
+  // WebRTC (which isn't ready at onConnect).
+  const sessionFlushedRef = useRef(false);
+  const flushPendingRef = useRef<() => void>(() => {});
+  flushPendingRef.current = () => {
+    if (sessionFlushedRef.current) return;
+    sessionFlushedRef.current = true;
+    const resume = buildResumeContext(timelineRef.current);
+    if (resume) conversationRef.current?.sendContextualUpdate(resume);
+    const queued = pendingTextRef.current;
+    pendingTextRef.current = [];
+    console.log("[voice] flushing", queued.length, "queued msg(s)");
+    queued.forEach((t) => {
+      console.log("[voice] flushing queued user msg:", t);
+      conversationRef.current?.sendUserMessage(t);
+    });
+  };
   // When the agent last stopped speaking, for the phantom-turn echo window.
   const spokeEndedAtRef = useRef(0);
   const endSessionRef = useRef(conversation.endSession);
@@ -275,7 +425,12 @@ function Stage() {
           const level = Math.min(1, (sum / data.length / 255) * 2.4);
           setAmplitude(level);
           // Voice, an agent reply, or a tool in flight all count as activity.
-          if (level > SILENCE_LEVEL || speakingRef.current || toolPendingRef.current) {
+          if (
+            textModeRef.current ||
+            level > SILENCE_LEVEL ||
+            speakingRef.current ||
+            toolPendingRef.current
+          ) {
             lastActivity = Date.now();
           } else if (Date.now() - lastActivity > SILENCE_TIMEOUT_MS) {
             endSessionRef.current();
@@ -298,58 +453,99 @@ function Stage() {
     : status === "connected"
     ? toolPending
       ? "thinking"
-      : isSpeaking
+      : isSpeaking || ttsSpeaking
       ? "speaking"
       : "listening"
     : "idle";
 
-  const startSession = useCallback(async () => {
-    setErrored(false);
-    setErrorMsg(undefined);
-    try {
-      // Request the mic synchronously, before any await, so the permission
-      // prompt fires inside the orb-tap's user gesture. Mobile Safari rejects
-      // getUserMedia with NotAllowedError (and shows no prompt) if the gesture
-      // has already been consumed by an awaited fetch — so we grab it first and
-      // let the SDK reuse the granted permission below.
-      await navigator.mediaDevices.getUserMedia({ audio: true });
+  // Self-handle so the mic-denied fallback can re-fire over the text transport.
+  const startSessionRef = useRef<
+    (opts?: { textOnly?: boolean }) => Promise<void>
+  >(() => Promise.resolve());
 
-      const res = await fetch("/api/conversation-token");
-      if (!res.ok) throw new Error(`token request failed (${res.status})`);
-      const { conversationToken } = (await res.json()) as {
-        conversationToken: string;
-      };
-      console.log("[voice] starting session (webrtc)…");
-      await conversation.startSession({
-        conversationToken,
-        connectionType: "webrtc",
-        // WebRTC transport: LiveKit handles audio with integrated echo
-        // cancellation and reliable barge-in. (The websocket transport streams
-        // the transcript earlier but plays audio via Web Audio, which browsers
-        // don't echo-cancel — on speakers the agent hears itself and loops.)
-        // NOTE: the agent's greeting is suppressed by blanking "First message" in
-        // the agent's dashboard config — NOT via a conversation override here.
-        // Sending an un-allowlisted `overrides.agent.firstMessage` makes the
-        // server reject the session with an error event that crashes the SDK.
-      });
-    } catch (e) {
-      console.error("[voice] startSession threw:", e);
-      // A blocked/denied mic surfaces as NotAllowedError (often with no prompt,
-      // e.g. permission previously denied, or embedded in an iframe without
-      // allow="microphone"). Give an actionable message instead of the raw text.
-      const isMicDenied =
-        e instanceof DOMException &&
-        (e.name === "NotAllowedError" || e.name === "SecurityError");
-      setErrorMsg(
-        isMicDenied
-          ? "Microphone access is blocked. Allow the mic for this site in your browser settings, then tap to try again."
-          : e instanceof Error
-          ? e.message
-          : "Could not start the session"
-      );
-      setErrored(true);
-    }
-  }, [conversation]);
+  const startSession = useCallback(
+    async ({ textOnly = false }: { textOnly?: boolean } = {}) => {
+      console.log("[voice] startSession called; textOnly=", textOnly, "status=", status);
+      sessionFlushedRef.current = false;
+      setErrored(false);
+      setErrorMsg(undefined);
+      try {
+        if (textOnly) {
+          // Text-only: a websocket session that never requests the mic. Uses a
+          // signed URL (the WebRTC conversation token only works for the mic
+          // path). The agent still speaks its replies via audio output.
+          console.log("[voice] fetching /api/signed-url…");
+          const res = await fetch("/api/signed-url");
+          console.log("[voice] /api/signed-url status:", res.status);
+          if (!res.ok) {
+            const body = await res.text().catch(() => "");
+            throw new Error(`signed-url request failed (${res.status}) ${body}`);
+          }
+          const { signedUrl } = (await res.json()) as { signedUrl: string };
+          console.log("[voice] got signedUrl:", signedUrl?.slice(0, 60), "…");
+          console.log("[voice] starting session (text-only websocket)…");
+          liveSessionIsTextRef.current = true;
+          await conversation.startSession({ signedUrl, textOnly: true });
+          console.log("[voice] text-only startSession resolved");
+          return;
+        }
+
+        // Request the mic synchronously, before any await, so the permission
+        // prompt fires inside the orb-tap's user gesture. Mobile Safari rejects
+        // getUserMedia with NotAllowedError (and shows no prompt) if the gesture
+        // has already been consumed by an awaited fetch — so we grab it first and
+        // let the SDK reuse the granted permission below.
+        await navigator.mediaDevices.getUserMedia({ audio: true });
+
+        const res = await fetch("/api/conversation-token");
+        if (!res.ok) throw new Error(`token request failed (${res.status})`);
+        const { conversationToken } = (await res.json()) as {
+          conversationToken: string;
+        };
+        console.log("[voice] starting session (webrtc)…");
+        liveSessionIsTextRef.current = false;
+        await conversation.startSession({
+          conversationToken,
+          connectionType: "webrtc",
+          // WebRTC transport: LiveKit handles audio with integrated echo
+          // cancellation and reliable barge-in. (The websocket transport streams
+          // the transcript earlier but plays audio via Web Audio, which browsers
+          // don't echo-cancel — on speakers the agent hears itself and loops.)
+          // NOTE: the agent's greeting is suppressed by blanking "First message" in
+          // the agent's dashboard config — NOT via a conversation override here.
+          // Sending an un-allowlisted `overrides.agent.firstMessage` makes the
+          // server reject the session with an error event that crashes the SDK.
+        });
+      } catch (e) {
+        console.error("[voice] startSession threw:", e, "(textOnly=", textOnly, ")");
+        liveSessionIsTextRef.current = false;
+        // A blocked/denied mic surfaces as NotAllowedError (often with no prompt,
+        // e.g. permission previously denied, an in-app/webview browser, or iframe
+        // without allow="microphone"). Fall back to text-only so the user can
+        // still talk to the agent by typing.
+        const isMicDenied =
+          e instanceof DOMException &&
+          (e.name === "NotAllowedError" || e.name === "SecurityError");
+        if (isMicDenied && !textOnly) {
+          setTextMode(true);
+          // If a message was already queued (a tapped example or typed text),
+          // re-fire over the text transport so it isn't lost — otherwise just
+          // prompt the user to type.
+          if (pendingTextRef.current.length > 0) {
+            void startSessionRef.current({ textOnly: true });
+          } else {
+            setErrorMsg("Mic unavailable — type your message instead.");
+            setErrored(true);
+          }
+          return;
+        }
+        setErrorMsg(e instanceof Error ? e.message : "Could not start the session");
+        setErrored(true);
+      }
+    },
+    [conversation]
+  );
+  startSessionRef.current = startSession;
 
   const handleOrbClick = useCallback(() => {
     if (status === "connected" || status === "connecting") {
@@ -368,26 +564,36 @@ function Stage() {
       conversation.endSession();
     }
     pendingTextRef.current = [];
+    stopTts();
+    clearTextIdle();
     setTimeline([]);
     setToolPending(false);
     setErrored(false);
     setErrorMsg(undefined);
-  }, [status, conversation]);
+  }, [status, conversation, stopTts, clearTextIdle]);
 
   // Send a typed message (or a tapped to-do chip). Starts/queues if offline.
   const handleSendText = useCallback(
     (raw: string) => {
       const text = raw.trim();
       if (!text) return;
+      console.log("[voice] handleSendText:", text, "| status=", status, "| textMode=", textMode);
+      // Prime audio within this gesture so the spoken reply can autoplay later.
+      if (textMode) unlockTtsAudio();
       appendMsg("user", text);
       if (status === "connected") {
+        console.log("[voice] sending over live session");
         conversation.sendUserMessage(text);
       } else {
+        console.log("[voice] queueing + starting session (textOnly=", textMode, ")");
         pendingTextRef.current.push(text);
-        if (status !== "connecting") void startSession();
+        if (status !== "connecting") void startSession({ textOnly: textMode });
       }
+      // Text sessions have no mic watchdog — (re)start the idle hang-up timer so
+      // the session ends after a lull instead of the agent nudging forever.
+      if (textMode) armTextIdle();
     },
-    [appendMsg, conversation, status, startSession]
+    [appendMsg, conversation, status, startSession, textMode, unlockTtsAudio, armTextIdle]
   );
 
   const copy = STATE_COPY[state];
@@ -499,14 +705,52 @@ function Stage() {
             animate={{ opacity: 1 }}
             className="text-center"
           >
-            <span className="text-meta">{copy.label}</span>
+            <span className="text-meta">
+              {textMode && (state === "idle" || state === "listening")
+                ? "Type a message"
+                : copy.label}
+            </span>
             {state === "error" && errorMsg && (
               <span className="text-meta ml-1 text-destructive">— {errorMsg}</span>
             )}
           </motion.p>
 
           <div className="mt-2 flex flex-col items-center gap-2">
-            <VoiceOrb state={state} amplitude={amplitude} onClick={handleOrbClick} compact />
+            {textMode ? (
+              <>
+                <TextComposer onSend={handleSendText} disabled={status === "connecting"} />
+                <button
+                  type="button"
+                  onClick={() => {
+                    stopTts();
+                    clearTextIdle();
+                    if (status === "connected" || status === "connecting") {
+                      conversation.endSession();
+                    }
+                    setTextMode(false);
+                    setErrored(false);
+                    setErrorMsg(undefined);
+                  }}
+                  className="text-meta text-ink-mute underline-offset-2 hover:underline"
+                >
+                  Use voice instead
+                </button>
+              </>
+            ) : (
+              <>
+                <VoiceOrb state={state} amplitude={amplitude} onClick={handleOrbClick} compact />
+                <button
+                  type="button"
+                  onClick={() => {
+                    console.log("[voice] switching to text mode");
+                    setTextMode(true);
+                  }}
+                  className="text-meta text-ink-mute underline-offset-2 hover:underline"
+                >
+                  Type instead
+                </button>
+              </>
+            )}
           </div>
         </div>
       </div>
@@ -540,6 +784,53 @@ function TypewriterText({ text }: { text: string }) {
     return () => clearInterval(id);
   }, [words]);
   return <>{words.slice(0, count).join(" ")}</>;
+}
+
+/**
+ * Text fallback for when the mic is unavailable (blocked permission, in-app
+ * browser, etc.). Sends on Enter or the button; handleSendText starts a
+ * text-only session on the first message if one isn't already live.
+ */
+function TextComposer({
+  onSend,
+  disabled,
+}: {
+  onSend: (text: string) => void;
+  disabled?: boolean;
+}) {
+  const [value, setValue] = useState("");
+  const submit = () => {
+    const text = value.trim();
+    if (!text) return;
+    onSend(text);
+    setValue("");
+  };
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        submit();
+      }}
+      className="flex w-full max-w-md items-center gap-2"
+    >
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        placeholder="Type a message…"
+        autoFocus
+        enterKeyHint="send"
+        className="text-body flex-1 rounded-full border border-hairline bg-surface px-4 py-2.5 text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-accent/40"
+      />
+      <button
+        type="submit"
+        disabled={disabled || !value.trim()}
+        className="text-meta rounded-full bg-accent px-4 py-2.5 text-accent-foreground transition-opacity disabled:opacity-40"
+      >
+        Send
+      </button>
+    </form>
+  );
 }
 
 function EmptyState({ onPick }: { onPick: (prompt: string) => void }) {
