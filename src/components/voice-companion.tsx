@@ -103,6 +103,10 @@ function Stage() {
   const thinkingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dockRef = useRef<HTMLDivElement>(null);
   const [dockHeight, setDockHeight] = useState(0);
+  // How much the on-screen keyboard overlaps the bottom of the viewport, so the
+  // fixed dock (and its text input) can lift above it on mobile. iOS keeps fixed
+  // bottom elements pinned to the layout viewport, i.e. behind the keyboard.
+  const [keyboardInset, setKeyboardInset] = useState(0);
   // Text typed before the session is live; flushed once we connect.
   const pendingTextRef = useRef<string[]>([]);
 
@@ -263,6 +267,28 @@ function Stage() {
     ro.observe(el);
     setDockHeight(el.offsetHeight);
     return () => ro.disconnect();
+  }, []);
+
+  // Lift the dock above the mobile keyboard. When the keyboard opens, the visual
+  // viewport shrinks but the layout viewport (where `fixed` is anchored) doesn't,
+  // so a bottom-pinned dock ends up behind the keyboard. Track the overlap via
+  // visualViewport and translate the dock up by it.
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const update = () => {
+      const overlap = window.innerHeight - vv.height - vv.offsetTop;
+      // Threshold so browser-chrome/scrollbar deltas don't nudge the dock; only a
+      // real keyboard produces a large overlap.
+      setKeyboardInset(overlap > 80 ? Math.round(overlap) : 0);
+    };
+    update();
+    vv.addEventListener("resize", update);
+    vv.addEventListener("scroll", update);
+    return () => {
+      vv.removeEventListener("resize", update);
+      vv.removeEventListener("scroll", update);
+    };
   }, []);
 
   // Audio-reactive amplitude: read live frequency data while connected.
@@ -696,7 +722,8 @@ function Stage() {
           The chat scrolls beneath it; a gradient fades content into the dock. */}
       <div
         ref={dockRef}
-        className="pointer-events-none fixed inset-x-0 bottom-0 z-20 bg-gradient-to-t from-background from-55% via-background/85 to-transparent pt-16"
+        className="pointer-events-none fixed inset-x-0 bottom-0 z-20 bg-gradient-to-t from-background from-55% via-background/85 to-transparent pt-16 transition-transform duration-150"
+        style={keyboardInset ? { transform: `translateY(-${keyboardInset}px)` } : undefined}
       >
         <div className="pointer-events-auto mx-auto w-full max-w-6xl px-4 pb-5 sm:px-6 lg:px-10">
           <motion.p
@@ -820,7 +847,9 @@ function TextComposer({
         placeholder="Type a message…"
         autoFocus
         enterKeyHint="send"
-        className="text-body flex-1 rounded-full border border-hairline bg-surface px-4 py-2.5 text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-accent/40"
+        // text-base (16px) is required: iOS Safari zooms the page in when a
+        // focused input's font is below 16px. Keep it at/above that.
+        className="flex-1 rounded-full border border-hairline bg-surface px-4 py-2.5 text-base text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-accent/40"
       />
       <button
         type="submit"
